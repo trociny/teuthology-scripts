@@ -1,0 +1,121 @@
+#!/bin/sh
+
+SUCCES_EXIT_CODE=111
+
+PACKAGES_WITH_DEBUG='
+    ceph-common
+    ceph-fs-common
+    ceph-fuse
+    ceph-mds
+    ceph-mon
+    ceph-osd
+    ceph-test
+    libcephfs1
+    librados2
+    libradosstriper1
+    librbd1
+    librgw2
+    radosgw
+    rbd-fuse
+    rbd-mirror
+    rbd-nbd
+'
+
+usage()
+{
+    echo "usage: $0 /a/{run}/{job}/remote/{machine}/coredump/{core}" >&2
+    exit 1
+}
+
+locked_target()
+{
+    local machine_type=$1
+
+    teuthology-lock --machine-type ${machine_type} --list-targets |
+        python -c 'import yaml,sys; print yaml.safe_load(sys.stdin)["targets"].keys()[0];'
+}
+
+debug_session()
+{
+    set -ex
+
+    local run=$1
+    local machine_type=$2
+    local job=$3
+    local machine=$4
+    local core=$5
+    local teuthology_log="/a/${run}/${job}/teuthology.log"
+    local core_path="/a/${run}/${job}/remote/${machine}/coredump/${core}"
+    local binary apt_sources_cmd apt_install_cmd debug_host debug_user p
+
+    test -r "${core_path}" ||
+	return 1
+
+    binary=$(file "${core_path}" |
+		    sed -nEe "s|^.*from '([^ ]*) .*$|\\1|p")
+    test -n "${binary}"
+
+    apt_sources_cmd=$(
+	sed -nEe "s|^.*${machine}:Running: .*'(echo deb http://gitbuilder[^']*)'.*$|\\1|p" \
+	    "${teuthology_log}"
+    )
+    test -n "${apt_sources_cmd}" ||
+	return 1
+
+    apt_install_cmd=$(
+        sed -nEe "s|^.*${machine}:Running: .*'(sudo DEBIAN_FRONTEND=noninteractive apt-get .*install[^']*)'.*$|\\1|p" \
+	    "${teuthology_log}"
+    )
+    test -n "${apt_install_cmd}" ||
+	return 1
+    for p in $PACKAGES_WITH_DEBUG; do
+	apt_install_cmd=$(echo $apt_install_cmd |
+                              sed -Ee "s/ ($p)(=.[^ ]*) / \\1\\2 \\1-dbg\\2 /"
+        )
+    done
+
+    debug_host=$(locked_target ${machine_type})
+    if [ -z "${debug_host}" ]; then
+	teuthology-lock --machine-type ${machine_type} --lock-many 1 \
+			--desc "debugging job ${job} coredump"
+	sleep 5
+	debug_host=$(locked_target ${machine_type})
+    fi
+    test -n "${debug_host}" ||
+	return 1
+
+    debug_user=ubuntu
+
+    ssh ${debug_user}@${debug_host} "${apt_sources_cmd}"
+    ssh ${debug_user}@${debug_host} sudo DEBIAN_FRONTEND=noninteractive apt-get -y --force-yes update
+    ssh ${debug_user}@${debug_host} sudo DEBIAN_FRONTEND=noninteractive apt-get -y --force-yes install gdb
+    ssh ${debug_user}@${debug_host} "${apt_install_cmd}"
+    scp -C "${core_path}" ${debug_user}@${debug_host}:
+
+    set +x
+    echo "************************************************************"
+    echo "* ${debug_user}@${debug_host} prepared, use:"
+    echo "* ssh ${debug_user}@${debug_host} gdb ${binary} ${core}"
+    echo "************************************************************"
+}
+
+#
+# Main
+#
+
+core_path="$1"
+
+echo "${core_path}" |
+sed -Ene 's|^.*/([^/]*-([^-]*))/([0-9]*)/remote/([^/]*)/coredump/(.*.core)$|\1 \2 \3 \4 \5|p' |
+while read run machine_type job machine core; do
+    debug_session ${run} ${machine_type} ${job} ${machine} ${core} &&
+    exit ${SUCCES_EXIT_CODE}
+done
+exit_code=$?
+
+if [ ${exit_code} -eq 0 ]; then
+    # `while read` loop was skipped due to sed was not able to parse core_path
+    usage
+elif [ ${exit_code} -ne ${SUCCES_EXIT_CODE} ]; then
+    exit ${exit_code}
+fi
