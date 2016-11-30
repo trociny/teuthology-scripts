@@ -52,7 +52,7 @@ debug_session()
 	return 1
 
     binary=$(file "${core_path}" |
-		    sed -nEe "s|^.*from '([^ ]*) .*$|\\1|p")
+		    sed -nEe "s|^.*from '([^']*)'.*$|\\1|p")
     test -n "${binary}"
 
     apt_sources_cmd=$(
